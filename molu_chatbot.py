@@ -21,11 +21,21 @@ try:
 except ImportError:  # pragma: no cover - optional dependency for seeding
     np = None
 import sentencepiece as spm
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset, random_split
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.optim.lr_scheduler import LambdaLR
+    from torch.utils.data import DataLoader, Dataset, random_split
+except (ImportError, OSError, ValueError) as exc:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    LambdaLR = None  # type: ignore[assignment]
+    DataLoader = Dataset = random_split = None  # type: ignore[assignment]
+    _TORCH_IMPORT_ERROR: Optional[Exception] = exc
+else:
+    _TORCH_IMPORT_ERROR = None
 from tqdm.auto import tqdm
 
 
@@ -108,6 +118,7 @@ class TrainingConfig:
 
 
 def set_seed(seed: int) -> None:
+    require_torch()
     random.seed(seed)
     if np is not None:
         np.random.seed(seed)
@@ -125,6 +136,14 @@ def clean_text(text: str) -> str:
 def is_korean(text: str) -> bool:
     kor = len(re.findall(r"[가-힣]", text))
     return kor >= max(2, int(0.2 * len(text)))
+
+
+def require_torch() -> None:
+    if torch is None:
+        message = "PyTorch is required for this operation but could not be imported."
+        if _TORCH_IMPORT_ERROR is not None:
+            raise RuntimeError(message) from _TORCH_IMPORT_ERROR
+        raise RuntimeError(message)
 
 
 # ---------------------------------------------------------------------------
@@ -154,19 +173,60 @@ def load_dialogue_pairs(cfg: DataConfig) -> List[Tuple[str, str]]:
                         u.get("id", ""),
                     ),
                 )
+
                 sequence: List[Tuple[str, Optional[str]]] = []
+                current_speaker: Optional[str] = None
+                buffer: List[str] = []
+
+                def flush_buffer() -> None:
+                    nonlocal buffer, current_speaker
+                    if not buffer:
+                        return
+                    combined = clean_text(" ".join(buffer))
+                    buffer = []
+                    if not combined:
+                        return
+                    if len(combined) < cfg.min_len or len(combined) > cfg.max_len:
+                        return
+                    if not is_korean(combined):
+                        return
+                    sequence.append((combined, current_speaker))
+
                 for utt in utts:
-                    raw = utt.get(cfg.text_field) or utt.get("form") or utt.get("original_form") or ""
+                    raw = (
+                        utt.get(cfg.text_field)
+                        or utt.get("form")
+                        or utt.get("original_form")
+                        or ""
+                    )
                     text = clean_text(raw)
                     if not text:
                         continue
-                    if len(text) < cfg.min_len or len(text) > cfg.max_len:
-                        continue
                     if not is_korean(text):
                         continue
-                    sequence.append((text, utt.get("speaker_id")))
+                    if len(text) > cfg.max_len:
+                        continue
+
+                    speaker = utt.get("speaker_id")
+                    if current_speaker is None:
+                        current_speaker = speaker
+                        buffer.append(text)
+                        continue
+
+                    if speaker == current_speaker:
+                        buffer.append(text)
+                    else:
+                        flush_buffer()
+                        current_speaker = speaker
+                        buffer.append(text)
+
+                flush_buffer()
 
                 if len(sequence) < 2:
+                    continue
+
+                speakers = {speaker for _, speaker in sequence if speaker is not None}
+                if len(speakers) < 2:
                     continue
 
                 if cfg.pairing_mode == "turn_change":
@@ -290,69 +350,88 @@ def create_labeled_sequences(
         rsp_ids = tokenizer.encode(rsp) + [tokenizer.eos_id]
         input_ids = ctx_ids + rsp_ids
         labels = [-100] * len(ctx_ids) + rsp_ids
-        if labels:
-            labels[-1] = -100  # prevent predicting the padding after EOS
         labeled.append((input_ids, labels))
     return labeled
 
 
-class PackedConversationDataset(Dataset):
-    """Dataset that packs token sequences into fixed-length windows."""
+def pack_token_sequences(
+    sequences: Sequence[Tuple[List[int], List[int]]],
+    max_length: int,
+    pad_id: int,
+) -> Tuple[List[List[int]], List[List[int]], List[List[int]], int]:
+    inputs: List[List[int]] = []
+    labels: List[List[int]] = []
+    attention_masks: List[List[int]] = []
+    tokens_per_epoch = 0
 
-    def __init__(
-        self,
-        sequences: Sequence[Tuple[List[int], List[int]]],
-        max_length: int,
-        pad_id: int,
-    ) -> None:
-        inputs: List[List[int]] = []
-        labels: List[List[int]] = []
-        attention_masks: List[List[int]] = []
-        tokens_per_epoch = 0
+    token_stream: List[int] = []
+    label_stream: List[int] = []
+    for tokens, lbls in sequences:
+        token_stream.extend(tokens)
+        label_stream.extend(lbls)
 
-        token_stream: List[int] = []
-        label_stream: List[int] = []
-        for tokens, lbls in sequences:
-            token_stream.extend(tokens)
-            label_stream.extend(lbls)
-            if label_stream:
-                label_stream[-1] = -100
+    for start in range(0, len(token_stream), max_length):
+        end = min(start + max_length, len(token_stream))
+        chunk_tokens = token_stream[start:end]
+        chunk_labels = label_stream[start:end]
+        attn = [1] * len(chunk_tokens)
 
-        for start in range(0, len(token_stream), max_length):
-            end = min(start + max_length, len(token_stream))
-            chunk_tokens = token_stream[start:end]
-            chunk_labels = label_stream[start:end]
-            attn = [1] * len(chunk_tokens)
+        if len(chunk_tokens) < max_length:
+            pad_len = max_length - len(chunk_tokens)
+            chunk_tokens = chunk_tokens + [pad_id] * pad_len
+            chunk_labels = chunk_labels + [-100] * pad_len
+            attn = attn + [0] * pad_len
 
-            if len(chunk_tokens) < max_length:
-                pad_len = max_length - len(chunk_tokens)
-                chunk_tokens = chunk_tokens + [pad_id] * pad_len
-                chunk_labels = chunk_labels + [-100] * pad_len
-                attn = attn + [0] * pad_len
+        tokens_per_epoch += sum(attn)
+        inputs.append(chunk_tokens)
+        labels.append(chunk_labels)
+        attention_masks.append(attn)
 
-            tokens_per_epoch += sum(attn)
-            inputs.append(chunk_tokens)
-            labels.append(chunk_labels)
-            attention_masks.append(attn)
+    return inputs, labels, attention_masks, tokens_per_epoch
 
-        if not inputs:
-            raise RuntimeError("Packed dataset is empty after processing sequences.")
 
-        self.input_ids = torch.tensor(inputs, dtype=torch.long)
-        self.labels = torch.tensor(labels, dtype=torch.long)
-        self.attention_mask = torch.tensor(attention_masks, dtype=torch.long)
-        self.tokens_per_epoch = tokens_per_epoch
-        self.max_length = max_length
+if torch is not None:
 
-    def __len__(self) -> int:
-        return self.input_ids.size(0)
+    class PackedConversationDataset(Dataset):
+        """Dataset that packs token sequences into fixed-length windows."""
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        return {
-            "input_ids": self.input_ids[index],
-            "labels": self.labels[index],
-            "attention_mask": self.attention_mask[index],
-        }
+        def __init__(
+            self,
+            sequences: Sequence[Tuple[List[int], List[int]]],
+            max_length: int,
+            pad_id: int,
+        ) -> None:
+            inputs, labels, attention_masks, tokens_per_epoch = pack_token_sequences(
+                sequences, max_length, pad_id
+            )
+
+            if not inputs:
+                raise RuntimeError(
+                    "Packed dataset is empty after processing sequences."
+                )
+
+            self.input_ids = torch.tensor(inputs, dtype=torch.long)
+            self.labels = torch.tensor(labels, dtype=torch.long)
+            self.attention_mask = torch.tensor(attention_masks, dtype=torch.long)
+            self.tokens_per_epoch = tokens_per_epoch
+            self.max_length = max_length
+
+        def __len__(self) -> int:
+            return self.input_ids.size(0)
+
+        def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+            return {
+                "input_ids": self.input_ids[index],
+                "labels": self.labels[index],
+                "attention_mask": self.attention_mask[index],
+            }
+
+
+else:
+
+    class PackedConversationDataset:  # pragma: no cover - torch unavailable
+        def __init__(self, *args, **kwargs) -> None:
+            require_torch()
 
 
 # ---------------------------------------------------------------------------
@@ -360,107 +439,136 @@ class PackedConversationDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError("d_model must be divisible by n_heads")
-        self.nh = n_heads
-        self.dk = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
+if torch is not None:
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        bsz, seq_len, hidden = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
+    class CausalSelfAttention(nn.Module):
+        def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+            super().__init__()
+            if d_model % n_heads != 0:
+                raise ValueError("d_model must be divisible by n_heads")
+            self.nh = n_heads
+            self.dk = d_model // n_heads
+            self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+            self.proj = nn.Linear(d_model, d_model, bias=False)
+            self.attn_drop = nn.Dropout(dropout)
+            self.resid_drop = nn.Dropout(dropout)
 
-        q = q.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
+        def forward(
+            self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            bsz, seq_len, hidden = x.shape
+            qkv = self.qkv(x)
+            q, k, v = qkv.chunk(3, dim=-1)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)
-        causal = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=x.device), diagonal=1
-        )
-        att = att + causal
-        if attn_mask is not None:
-            pad_mask = (attn_mask == 0).unsqueeze(1).unsqueeze(2)
-            att = att.masked_fill(pad_mask, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, hidden)
-        return self.resid_drop(self.proj(y))
+            q = q.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
+            k = k.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
+            v = v.view(bsz, seq_len, self.nh, self.dk).transpose(1, 2)
 
-
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_ratio * d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_ratio * d_model, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask)
-        x = x + self.mlp(self.ln2(x))
-        return x
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)
+            mask = torch.tril(
+                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool)
+            )
+            causal = torch.where(
+                mask, torch.zeros_like(att), torch.full_like(att, float("-inf"))
+            )
+            att = att + causal
+            if attn_mask is not None:
+                pad_mask = (attn_mask == 0).unsqueeze(1).unsqueeze(2)
+                att = att.masked_fill(pad_mask, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_drop(att)
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(bsz, seq_len, hidden)
+            return self.resid_drop(self.proj(y))
 
 
-class GPTScratch(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        d_model: int = 512,
-        n_layers: int = 8,
-        n_heads: int = 8,
-        max_len: int = 160,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.max_len = max_len
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_len, d_model)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads, 4, dropout) for _ in range(n_layers)]
-        )
-        self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.apply(self._init_weights)
+    class TransformerBlock(nn.Module):
+        def __init__(
+            self, d_model: int, n_heads: int, mlp_ratio: int = 4, dropout: float = 0.1
+        ) -> None:
+            super().__init__()
+            self.ln1 = nn.LayerNorm(d_model)
+            self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, mlp_ratio * d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mlp_ratio * d_model, d_model),
+                nn.Dropout(dropout),
+            )
 
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        def forward(
+            self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            x = x + self.attn(self.ln1(x), attn_mask)
+            x = x + self.mlp(self.ln2(x))
+            return x
 
-    def forward(
-        self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        bsz, seq_len = x.shape
-        if seq_len > self.max_len:
-            x = x[:, -self.max_len :]
-            seq_len = x.shape[1]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, -self.max_len :]
-        pos = torch.arange(0, seq_len, device=x.device).unsqueeze(0)
-        hidden = self.drop(self.tok_emb(x) + self.pos_emb(pos))
-        for block in self.blocks:
-            hidden = block(hidden, attention_mask)
-        hidden = self.ln_f(hidden)
-        return self.head(hidden)
+
+    class GPTScratch(nn.Module):
+        def __init__(
+            self,
+            vocab_size: int,
+            d_model: int = 512,
+            n_layers: int = 8,
+            n_heads: int = 8,
+            max_len: int = 160,
+            dropout: float = 0.1,
+        ) -> None:
+            super().__init__()
+            self.max_len = max_len
+            self.tok_emb = nn.Embedding(vocab_size, d_model)
+            self.pos_emb = nn.Embedding(max_len, d_model)
+            self.drop = nn.Dropout(dropout)
+            self.blocks = nn.ModuleList(
+                [TransformerBlock(d_model, n_heads, 4, dropout) for _ in range(n_layers)]
+            )
+            self.ln_f = nn.LayerNorm(d_model)
+            self.head = nn.Linear(d_model, vocab_size, bias=False)
+            self.apply(self._init_weights)
+
+        def _init_weights(self, module: nn.Module) -> None:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+        def forward(
+            self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            bsz, seq_len = x.shape
+            if seq_len > self.max_len:
+                x = x[:, -self.max_len :]
+                seq_len = x.shape[1]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, -self.max_len :]
+            pos = torch.arange(0, seq_len, device=x.device).unsqueeze(0)
+            hidden = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+            for block in self.blocks:
+                hidden = block(hidden, attention_mask)
+            hidden = self.ln_f(hidden)
+            return self.head(hidden)
+
+
+else:
+
+    class CausalSelfAttention:  # pragma: no cover - torch unavailable
+        def __init__(self, *args, **kwargs) -> None:
+            require_torch()
+
+
+    class TransformerBlock:  # pragma: no cover - torch unavailable
+        def __init__(self, *args, **kwargs) -> None:
+            require_torch()
+
+
+    class GPTScratch:  # pragma: no cover - torch unavailable
+        def __init__(self, *args, **kwargs) -> None:
+            require_torch()
+
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +577,7 @@ class GPTScratch(nn.Module):
 
 
 def lm_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    require_torch()
     vocab = logits.size(-1)
     pred = logits[:, :-1].contiguous().view(-1, vocab)
     gold = targets[:, 1:].contiguous().view(-1)
@@ -476,6 +585,7 @@ def lm_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 
 def count_active_tokens(labels: torch.Tensor) -> int:
+    require_torch()
     return int((labels[:, 1:] != -100).sum().item())
 
 
@@ -485,6 +595,7 @@ def evaluate(
     device: torch.device,
     autocast_ctx,
 ) -> Tuple[float, int]:
+    require_torch()
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -507,6 +618,7 @@ def build_scheduler(
     train_cfg: TrainingConfig,
     total_updates: int,
 ) -> Optional[LambdaLR]:
+    require_torch()
     if total_updates <= 0:
         return None
 
@@ -528,6 +640,7 @@ def train_model(
     train_cfg: TrainingConfig,
     data_cfg: DataConfig,
 ) -> Dict[str, List[Dict[str, float]]]:
+    require_torch()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(train_cfg.seed)
 
@@ -685,7 +798,10 @@ def train_model(
 # ---------------------------------------------------------------------------
 
 
-def sample_top_p(logits_row: torch.Tensor, top_p: float = 0.9, temperature: float = 0.7) -> int:
+def sample_top_p(
+    logits_row: torch.Tensor, top_p: float = 0.9, temperature: float = 0.7
+) -> int:
+    require_torch()
     logits_row = logits_row / max(1e-6, temperature)
     probs = torch.softmax(logits_row, dim=-1)
     sorted_probs, sorted_idx = torch.sort(probs, descending=True)
@@ -702,42 +818,54 @@ def sample_top_p(logits_row: torch.Tensor, top_p: float = 0.9, temperature: floa
     return int(sorted_idx[choice])
 
 
-@torch.no_grad()
-def generate_reply(
-    model: GPTScratch,
-    tokenizer: SentencePieceTokenizer,
-    prompt: str,
-    max_ctx: Optional[int] = None,
-    max_new_tokens: int = 96,
-    top_p: float = 0.9,
-    temperature: float = 0.7,
-    device: Optional[torch.device] = None,
-) -> str:
-    device = device or next(model.parameters()).device
-    context_limit = model.max_len if max_ctx is None else min(max_ctx, model.max_len)
-    context_limit = max(1, context_limit)
-    history = [tokenizer.bos_id] + tokenizer.encode(prompt) + [tokenizer.sep_id]
-    history = history[-context_limit:]
+if torch is not None:
 
-    for _ in range(max_new_tokens):
-        x = torch.tensor(history, dtype=torch.long, device=device).unsqueeze(0)
-        logits = model(x)
-        next_token = sample_top_p(logits[0, -1], top_p=top_p, temperature=temperature)
-        history.append(next_token)
-        if len(history) > context_limit:
-            history = history[-context_limit:]
-        if next_token == tokenizer.eos_id:
-            break
+    @torch.no_grad()
+    def generate_reply(
+        model: GPTScratch,
+        tokenizer: SentencePieceTokenizer,
+        prompt: str,
+        max_ctx: Optional[int] = None,
+        max_new_tokens: int = 96,
+        top_p: float = 0.9,
+        temperature: float = 0.7,
+        device: Optional[torch.device] = None,
+    ) -> str:
+        device = device or next(model.parameters()).device
+        context_limit = (
+            model.max_len if max_ctx is None else min(max_ctx, model.max_len)
+        )
+        context_limit = max(1, context_limit)
+        history = [tokenizer.bos_id] + tokenizer.encode(prompt) + [tokenizer.sep_id]
+        history = history[-context_limit:]
 
-    try:
-        last_sep = len(history) - 1 - history[::-1].index(tokenizer.sep_id)
-    except ValueError:
-        last_sep = 0
-    response_tokens = history[last_sep:]
-    return tokenizer.decode(response_tokens)
+        for _ in range(max_new_tokens):
+            x = torch.tensor(history, dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(x)
+            next_token = sample_top_p(
+                logits[0, -1], top_p=top_p, temperature=temperature
+            )
+            history.append(next_token)
+            if len(history) > context_limit:
+                history = history[-context_limit:]
+            if next_token == tokenizer.eos_id:
+                break
+
+        try:
+            last_sep = len(history) - 1 - history[::-1].index(tokenizer.sep_id)
+        except ValueError:
+            last_sep = 0
+        response_tokens = history[last_sep:]
+        return tokenizer.decode(response_tokens)
+
+else:
+
+    def generate_reply(*args, **kwargs):  # pragma: no cover - torch unavailable
+        require_torch()
 
 
 def load_checkpoint(model_dir: Path, device: torch.device) -> Tuple[GPTScratch, SentencePieceTokenizer, Dict]:
+    require_torch()
     model_dir = Path(model_dir)
     with open(model_dir / "config.json", "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
@@ -813,6 +941,7 @@ def run_train_from_args(args: argparse.Namespace) -> None:
 
 
 def run_chat_from_args(args: argparse.Namespace) -> None:
+    require_torch()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, tokenizer, cfg = load_checkpoint(Path(args.model_dir), device)
     reply = generate_reply(
