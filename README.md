@@ -28,6 +28,11 @@ inference utilities.
 > Replace `<your-account>` with the GitHub owner of the repository you cloned
 > from.
 
+By default the trainer now builds examples at each speaker change so prompts and
+replies always come from different participants. Pass
+`--pairing_mode next_sentence` if you prefer the legacy adjacent-utterance
+pairing.
+
 During training you will see tqdm progress bars with token-level losses. The
 best checkpoint (based on validation loss) and all configuration metadata are
 saved under `--output_dir`. Training history is written to
@@ -38,7 +43,7 @@ saved under `--output_dir`. Training history is written to
 ```
 python molu_chatbot.py train --zip_path <path/to/data.zip> [options]
 
---pairing_mode      How to pair utterances (`next_sentence` or `turn_change`).
+--pairing_mode      How to pair utterances (`turn_change` by default).
 --text_field        Which field to read from each utterance (`form` or `original_form`).
 --vocab_size        SentencePiece vocabulary size (default 16000).
 --d_model / --n_layers / --n_heads  Transformer dimensions.
