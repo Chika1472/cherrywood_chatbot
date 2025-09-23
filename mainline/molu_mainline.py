@@ -9,14 +9,16 @@ Original file is located at
 # 데이터 로드
 """
 
-# === pairs 생성 ===
-ZIP_PATH = "/content/NIKL_DIALOGUE_2024_v1.0.zip"   # 경로
+# === 텍스트 데이터 생성 ===
+ZIP_PATH = "/content/drive/MyDrive/Data/Dataset/Pretraining.zip"   # 경로
 import zipfile, json, io, re, random
 
 # 옵션
 PAIRING_MODE = "turn_change"
 TEXT_FIELD = "form"             # or "original_form"
-MIN_LEN, MAX_LEN = 1, 160       # 길이 필터
+MIN_TEXT_CHARS = 5              # 문장 필터
+MAX_TEXT_CHARS = 4000
+MAX_LEN = 160                   # 토크나이저 및 학습 시퀀스 길이
 SHUFFLE = True
 SEED = 42
 
@@ -30,7 +32,9 @@ def is_korean(text: str) -> bool:
     return kor >= max(2, int(0.2 * len(text)))
 
 pairs = []
+mono_docs = []
 n_files = 0
+missing_speaker_docs = 0
 rng = random.Random(SEED)
 with zipfile.ZipFile(ZIP_PATH) as zf:
     for name in zf.namelist():
@@ -42,30 +46,13 @@ with zipfile.ZipFile(ZIP_PATH) as zf:
         docs = data.get("document", [])
         for doc in docs:
             utts = doc.get("utterance", [])
-            if any(("speaker_id" not in utt) or not utt.get("speaker_id") for utt in utts):
-                print(f"[skip] {doc.get('id', name)} missing speaker_id metadata")
+            if not isinstance(utts, list):
                 continue
             utts = sorted(
                 utts, key=lambda u: (u.get("start", float("inf")), u.get("id", ""))
             )
 
-            sequence = []
-            current_speaker = None
-            buffer = []
-
-            def flush_buffer():
-                if not buffer:
-                    return
-                combined = clean_text(" ".join(buffer))
-                buffer.clear()  # <- clear()
-                if not combined:
-                    return
-                if len(combined) < MIN_LEN or len(combined) > MAX_LEN:
-                    return
-                if not is_korean(combined):
-                    return
-                sequence.append((combined, current_speaker))
-
+            cleaned_turns = []
             for utt in utts:
                 if TEXT_FIELD == "form":
                     preferred = utt.get("form")
@@ -80,10 +67,40 @@ with zipfile.ZipFile(ZIP_PATH) as zf:
                     continue
                 if not is_korean(text):
                     continue
-                if len(text) > MAX_LEN:
+                if len(text) > MAX_TEXT_CHARS:
                     continue
 
-                speaker = utt.get("speaker_id")
+                cleaned_turns.append((text, utt.get("speaker_id")))
+
+            if not cleaned_turns:
+                continue
+
+            doc_text = clean_text(" ".join(text for text, _ in cleaned_turns))
+            if doc_text and len(doc_text) >= MIN_TEXT_CHARS and is_korean(doc_text):
+                mono_docs.append(doc_text)
+
+            if any((spk is None) or (str(spk).strip() == "") for _, spk in cleaned_turns):
+                missing_speaker_docs += 1
+                continue
+
+            sequence = []
+            current_speaker = None
+            buffer = []
+
+            def flush_buffer(speaker):
+                if not buffer:
+                    return
+                combined = clean_text(" ".join(buffer))
+                buffer.clear()
+                if not combined:
+                    return
+                if len(combined) < MIN_TEXT_CHARS or len(combined) > MAX_TEXT_CHARS:
+                    return
+                if not is_korean(combined):
+                    return
+                sequence.append((combined, speaker))
+
+            for text, speaker in cleaned_turns:
                 if current_speaker is None:
                     current_speaker = speaker
                     buffer.append(text)
@@ -92,11 +109,11 @@ with zipfile.ZipFile(ZIP_PATH) as zf:
                 if speaker == current_speaker:
                     buffer.append(text)
                 else:
-                    flush_buffer()
+                    flush_buffer(current_speaker)
                     current_speaker = speaker
                     buffer.append(text)
 
-            flush_buffer()
+            flush_buffer(current_speaker)
 
             if len(sequence) < 2:
                 continue
@@ -116,10 +133,20 @@ with zipfile.ZipFile(ZIP_PATH) as zf:
 
 if SHUFFLE:
     rng.shuffle(pairs)
+    rng.shuffle(mono_docs)
 
 print(f"JSON files read: {n_files}")
+print(f"Total documents: {len(mono_docs)}")
+if mono_docs:
+    sample_doc = mono_docs[0][:200] + ("..." if len(mono_docs[0]) > 200 else "")
+    print("Sample document:", sample_doc)
+if missing_speaker_docs and not pairs:
+    print(f"Documents without speaker metadata: {missing_speaker_docs}")
 print(f"Total pairs: {len(pairs)}")
-print("Sample:", pairs[0] if pairs else ("<empty>", "<empty>"))
+if pairs:
+    print("Sample pair:", pairs[0])
+else:
+    print("Sample pair: (<empty>, <empty>)")
 
 """# 토크나이저"""
 
@@ -127,9 +154,14 @@ print("Sample:", pairs[0] if pairs else ("<empty>", "<empty>"))
 
 import sentencepiece as spm
 
+if not mono_docs and not pairs:
+    raise RuntimeError("No usable text sequences were extracted from the dataset.")
+
 with open("corpus.txt", "w", encoding="utf-8") as f:
+    for doc in mono_docs:
+        f.write(doc.replace("\n", " ") + "\n")
     for q, a in pairs:
-        f.write(q.replace("\n"," ") + " <sep> " + a.replace("\n"," ") + "\n")
+        f.write(q.replace("\n", " ") + " <sep> " + a.replace("\n", " ") + "\n")
 
 spm.SentencePieceTrainer.train(
     input="corpus.txt",
@@ -171,6 +203,13 @@ def decode_text(ids):
     return sp.decode([i for i in ids if i not in drop])
 
 labeled = []
+for doc in mono_docs:
+    doc_ids = [BOS] + encode_text(doc) + [EOS]
+    if len(doc_ids) < 2:
+        continue
+    labels = doc_ids.copy()
+    labeled.append((doc_ids, labels))
+
 for ctx, rsp in pairs:
     ctx_ids = [BOS] + encode_text(ctx) + [SEP]
     rsp_ids = encode_text(rsp) + [EOS]
@@ -178,8 +217,14 @@ for ctx, rsp in pairs:
     labels = [-100] * len(ctx_ids) + rsp_ids
     labeled.append((input_ids, labels))
 
-print(f"Labeled pairs: {len(labeled)}")
-print("Sample labeled pair:", labeled[0] if labeled else ("<empty>", "<empty>"))
+print(f"Labeled sequences: {len(labeled)}")
+if labeled:
+    sample_inputs, sample_labels = labeled[0]
+    print("Sample labeled input:", sample_inputs[: min(len(sample_inputs), 32)])
+    print("Sample labeled labels:", sample_labels[: min(len(sample_labels), 32)])
+else:
+    print("Sample labeled input: []")
+    print("Sample labeled labels: []")
 
 def pack_token_sequences(sequences, max_length, pad_id):
     inputs, labels, attention_masks = [], [], []
@@ -341,22 +386,24 @@ class GPTScratch(nn.Module):
 def count_tokens_pairs(pairs, max_len=160):
     tot = 0
     for ctx, rsp in pairs:
-        ids = [257] + encode_text(ctx) + [258] + encode_text(rsp) + [259]  # BOS/SEP/EOS
+        ids = [BOS] + encode_text(ctx) + [SEP] + encode_text(rsp) + [EOS]
         tot += min(len(ids), max_len)
     return tot
 
 def count_tokens_mono(docs, max_len=160):
     tot = 0
     for s in docs:
-        ids = [257] + encode_text(s) + [259]
+        ids = [BOS] + encode_text(s) + [EOS]
         tot += min(len(ids), max_len)
     return tot
 
 TOK_PER_EPOCH = 0
-if 'pairs' in globals() and len(pairs) > 0:
+if pairs:
     TOK_PER_EPOCH += count_tokens_pairs(pairs, max_len=MAX_LEN)
-if 'mono_docs' in globals() and len(mono_docs) > 0:
+if mono_docs:
     TOK_PER_EPOCH += count_tokens_mono(mono_docs, max_len=MAX_LEN)
+
+USE_DIALOGUE_PROMPT = len(pairs) > 0
 
 print(f"≈ tokens per epoch: {TOK_PER_EPOCH:,}")
 
@@ -529,24 +576,24 @@ def generate_reply(prompt: str,
                    max_ctx: int = HIST_MAX,
                    max_new_tokens: int = MAX_NEW,
                    top_p=0.9, temperature=0.7):
-    history = [BOS] + encode_text(prompt) + [SEP]
+    prompt_ids = encode_text(prompt)
+    history = [BOS] + prompt_ids
+    if USE_DIALOGUE_PROMPT:
+        history.append(SEP)
     history = history[-max_ctx:]
+    initial_len = len(history)
     x = torch.tensor(history, dtype=torch.long, device=device).unsqueeze(0)
     for _ in range(max_new_tokens):
         logits = model(x)
         nxt = sample_top_p(logits[0, -1], top_p=top_p, temperature=temperature)
         history.append(nxt)
         x = torch.tensor(history[-max_ctx:], dtype=torch.long, device=device).unsqueeze(0)
-        if nxt == EOS: break
-    try:
-        last_sep = len(history) - 1 - history[::-1].index(SEP)
-    except ValueError:
-        last_sep = 0
-    try:
-        last_eos = len(history) - 1 - history[::-1].index(EOS)
-    except ValueError:
-        last_eos = len(history)
-    return decode_text(history[last_sep:last_eos]).strip()
+        if nxt == EOS:
+            break
+    generated = history[initial_len:]
+    if EOS in generated:
+        generated = generated[: generated.index(EOS)]
+    return decode_text(generated).strip()
 
 """# 채팅"""
 
