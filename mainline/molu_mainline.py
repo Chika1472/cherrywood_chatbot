@@ -31,6 +31,51 @@ def is_korean(text: str) -> bool:
     kor = len(re.findall(r"[가-힣]", text))
     return kor >= max(2, int(0.2 * len(text)))
 
+TEXT_FALLBACK_KEYS = {"text", "content", "body", "article", "paragraphs", "summary"}
+
+
+def iter_conversation_docs(payload):
+    if isinstance(payload, dict):
+        docs = payload.get("document")
+        if isinstance(docs, list):
+            for doc in docs:
+                if isinstance(doc, dict) and isinstance(doc.get("utterance"), list):
+                    yield doc
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from iter_conversation_docs(item)
+
+
+def extract_top_level_texts(payload):
+    texts = []
+
+    def collect_strings(value):
+        results = []
+        if isinstance(value, str):
+            results.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    results.append(item)
+        return results
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in TEXT_FALLBACK_KEYS:
+                texts.extend(collect_strings(value))
+            elif isinstance(value, str):
+                texts.extend(collect_strings(value))
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                texts.extend(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            texts.extend(extract_top_level_texts(item))
+    elif isinstance(payload, str):
+        texts.append(payload)
+
+    return texts
+
+
 pairs = []
 mono_docs = []
 n_files = 0
@@ -43,93 +88,114 @@ with zipfile.ZipFile(ZIP_PATH) as zf:
         n_files += 1
         with zf.open(name) as f:
             data = json.load(io.TextIOWrapper(f, encoding="utf-8"))
-        docs = data.get("document", [])
-        for doc in docs:
-            utts = doc.get("utterance", [])
-            if not isinstance(utts, list):
-                continue
-            utts = sorted(
-                utts, key=lambda u: (u.get("start", float("inf")), u.get("id", ""))
-            )
+        docs = list(iter_conversation_docs(data))
+        if docs:
+            for doc in docs:
+                utts = doc.get("utterance", [])
+                if not isinstance(utts, list):
+                    continue
+                utts = sorted(
+                    utts, key=lambda u: (u.get("start", float("inf")), u.get("id", ""))
+                )
 
-            cleaned_turns = []
-            for utt in utts:
-                if TEXT_FIELD == "form":
-                    preferred = utt.get("form")
-                elif TEXT_FIELD == "original_form":
-                    preferred = utt.get("original_form")
+                cleaned_turns = []
+                for utt in utts:
+                    if TEXT_FIELD == "form":
+                        preferred = utt.get("form")
+                    elif TEXT_FIELD == "original_form":
+                        preferred = utt.get("original_form")
+                    else:
+                        raise ValueError("TEXT_FIELD must be 'form' or 'original_form'")
+
+                    raw = preferred or utt.get("form") or utt.get("original_form") or ""
+                    text = clean_text(raw)
+                    if not text:
+                        continue
+                    if not is_korean(text):
+                        continue
+                    if len(text) > MAX_TEXT_CHARS:
+                        continue
+
+                    speaker = utt.get("speaker_id")
+                    if speaker is not None:
+                        speaker = str(speaker).strip() or None
+                    cleaned_turns.append((text, speaker))
+
+                if not cleaned_turns:
+                    continue
+
+                doc_text = clean_text(" ".join(text for text, _ in cleaned_turns))
+                if doc_text and len(doc_text) >= MIN_TEXT_CHARS and is_korean(doc_text):
+                    mono_docs.append(doc_text)
+
+                has_speaker_annotations = any(
+                    speaker is not None for _, speaker in cleaned_turns
+                )
+                if not has_speaker_annotations:
+                    continue
+
+                if any(speaker is None for _, speaker in cleaned_turns):
+                    missing_speaker_docs += 1
+                    continue
+
+                sequence = []
+                current_speaker = None
+                buffer = []
+
+                def flush_buffer(speaker):
+                    if not buffer:
+                        return
+                    combined = clean_text(" ".join(buffer))
+                    buffer.clear()
+                    if not combined:
+                        return
+                    if len(combined) < MIN_TEXT_CHARS or len(combined) > MAX_TEXT_CHARS:
+                        return
+                    if not is_korean(combined):
+                        return
+                    sequence.append((combined, speaker))
+
+                for text, speaker in cleaned_turns:
+                    if current_speaker is None:
+                        current_speaker = speaker
+                        buffer.append(text)
+                        continue
+
+                    if speaker == current_speaker:
+                        buffer.append(text)
+                    else:
+                        flush_buffer(current_speaker)
+                        current_speaker = speaker
+                        buffer.append(text)
+
+                flush_buffer(current_speaker)
+
+                if len(sequence) < 2:
+                    continue
+
+                speakers = {speaker for _, speaker in sequence if speaker is not None}
+                if len(speakers) < 2:
+                    continue
+
+                if PAIRING_MODE == "turn_change":
+                    for (a, spk_a), (b, spk_b) in zip(sequence, sequence[1:]):
+                        if spk_a != spk_b and a and b:
+                            pairs.append((a, b))
                 else:
-                    raise ValueError("TEXT_FIELD must be 'form' or 'original_form'")
-
-                raw = preferred or utt.get("form") or utt.get("original_form") or ""
-                text = clean_text(raw)
+                    for (a, _), (b, _) in zip(sequence, sequence[1:]):
+                        if a and b:
+                            pairs.append((a, b))
+        else:
+            prose_texts = extract_top_level_texts(data)
+            for raw_text in prose_texts:
+                text = clean_text(raw_text)
                 if not text:
+                    continue
+                if len(text) < MIN_TEXT_CHARS or len(text) > MAX_TEXT_CHARS:
                     continue
                 if not is_korean(text):
                     continue
-                if len(text) > MAX_TEXT_CHARS:
-                    continue
-
-                cleaned_turns.append((text, utt.get("speaker_id")))
-
-            if not cleaned_turns:
-                continue
-
-            doc_text = clean_text(" ".join(text for text, _ in cleaned_turns))
-            if doc_text and len(doc_text) >= MIN_TEXT_CHARS and is_korean(doc_text):
-                mono_docs.append(doc_text)
-
-            if any((spk is None) or (str(spk).strip() == "") for _, spk in cleaned_turns):
-                missing_speaker_docs += 1
-                continue
-
-            sequence = []
-            current_speaker = None
-            buffer = []
-
-            def flush_buffer(speaker):
-                if not buffer:
-                    return
-                combined = clean_text(" ".join(buffer))
-                buffer.clear()
-                if not combined:
-                    return
-                if len(combined) < MIN_TEXT_CHARS or len(combined) > MAX_TEXT_CHARS:
-                    return
-                if not is_korean(combined):
-                    return
-                sequence.append((combined, speaker))
-
-            for text, speaker in cleaned_turns:
-                if current_speaker is None:
-                    current_speaker = speaker
-                    buffer.append(text)
-                    continue
-
-                if speaker == current_speaker:
-                    buffer.append(text)
-                else:
-                    flush_buffer(current_speaker)
-                    current_speaker = speaker
-                    buffer.append(text)
-
-            flush_buffer(current_speaker)
-
-            if len(sequence) < 2:
-                continue
-
-            speakers = {speaker for _, speaker in sequence if speaker is not None}
-            if len(speakers) < 2:
-                continue
-
-            if PAIRING_MODE == "turn_change":
-                for (a, spk_a), (b, spk_b) in zip(sequence, sequence[1:]):
-                    if spk_a != spk_b and a and b:
-                        pairs.append((a, b))
-            else:
-                for (a, _), (b, _) in zip(sequence, sequence[1:]):
-                    if a and b:
-                        pairs.append((a, b))
+                mono_docs.append(text)
 
 if SHUFFLE:
     rng.shuffle(pairs)
