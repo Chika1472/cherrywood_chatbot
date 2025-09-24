@@ -1,4 +1,5 @@
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -10,7 +11,9 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from molu_chatbot import (
+os.environ.setdefault("MOLU_SKIP_EXECUTION", "1")
+
+from mainline.molu_mainline import (
     DataConfig,
     create_labeled_sequences,
     load_dialogue_pairs,
