@@ -292,3 +292,36 @@ def test_load_dialogue_pairs_handles_prose_documents(tmp_path: Path):
     assert pairs == []
     assert mono_docs, "Expected prose documents to populate mono_docs"
     assert any("맑은 하늘" in doc for doc in mono_docs)
+
+
+def test_load_dialogue_pairs_handles_nested_prose_documents(tmp_path: Path):
+    payload = {
+        "id": "news-2",
+        "document": [
+            {
+                "id": "article-1",
+                "paragraphs": [
+                    {"text": "봄비가 촉촉하게 내려 도심 가로수가 더욱 푸르게 물들었습니다."},
+                    {
+                        "text": [
+                            "주말 사이 시민들은 공원을 찾아 산책을 즐겼고",
+                            "도서관과 미술관 같은 실내 시설도 붐볐습니다.",
+                        ]
+                    },
+                ],
+                "metadata": {"category": "society"},
+            }
+        ],
+    }
+
+    zip_path = make_zip(tmp_path / "nested_news.zip", payload)
+    cfg = DataConfig(
+        zip_path=str(zip_path),
+        text_field="form",
+        shuffle=False,
+    )
+
+    pairs, mono_docs = unpack_pairs(load_dialogue_pairs(cfg))
+    assert pairs == []
+    assert mono_docs, "Nested prose structures should populate mono_docs"
+    assert any("봄비가 촉촉" in doc for doc in mono_docs)

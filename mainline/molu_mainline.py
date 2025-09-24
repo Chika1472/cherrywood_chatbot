@@ -68,28 +68,32 @@ def _collect_strings(value: object) -> List[str]:
             strings.append(cleaned)
     elif isinstance(value, list):
         for item in value:
-            if isinstance(item, str):
-                cleaned = clean_text(item)
-                if cleaned:
-                    strings.append(cleaned)
+            strings.extend(_collect_strings(item))
+    elif isinstance(value, dict):
+        for inner in value.values():
+            strings.extend(_collect_strings(inner))
     return strings
 
 
 def _extract_top_level_texts(payload: object, fallback_fields: Sequence[str]) -> List[str]:
     texts: List[str] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            if key in fallback_fields:
-                texts.extend(_collect_strings(value))
-            elif isinstance(value, str):
-                texts.extend(_collect_strings(value))
-            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
-                texts.extend(_collect_strings(value))
-    elif isinstance(payload, list):
-        for item in payload:
-            texts.extend(_extract_top_level_texts(item, fallback_fields))
-    elif isinstance(payload, str):
-        texts.extend(_collect_strings(payload))
+    
+    def walk(obj: object) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in fallback_fields:
+                    texts.extend(_collect_strings(value))
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+                elif isinstance(value, str):
+                    texts.extend(_collect_strings(value))
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+        elif isinstance(obj, str):
+            texts.extend(_collect_strings(obj))
+
+    walk(payload)
     return texts
 
 
@@ -147,7 +151,7 @@ def load_dialogue_pairs(cfg: DataConfig) -> Tuple[List[Tuple[str, str]], List[st
                 continue
             n_files += 1
             with zf.open(name) as f:
-                data = json.load(io.TextIOWrapper(f, encoding="utf-8"))
+                data = json.load(io.TextIOWrapper(f, encoding="utf-8-sig"))
 
             docs = list(_iter_conversation_docs(data))
             if docs:
