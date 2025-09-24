@@ -1,4 +1,5 @@
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -10,7 +11,9 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from molu_chatbot import (
+os.environ.setdefault("MOLU_SKIP_EXECUTION", "1")
+
+from mainline.molu_mainline import (
     DataConfig,
     create_labeled_sequences,
     load_dialogue_pairs,
@@ -44,6 +47,20 @@ def make_zip(path: Path, payload: dict) -> Path:
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("doc.json", json.dumps(payload, ensure_ascii=False))
     return path
+
+
+def unpack_pairs(result):
+    if isinstance(result, tuple):
+        if len(result) == 0:
+            return [], []
+        if len(result) == 1:
+            return result[0], []
+        return result[0], result[1]
+    if hasattr(result, "pairs") and hasattr(result, "mono_docs"):
+        return result.pairs, result.mono_docs
+    if hasattr(result, "pairs"):
+        return result.pairs, getattr(result, "mono_docs", [])
+    return result, []
 
 
 def test_pack_sequences_preserves_eos():
@@ -129,11 +146,12 @@ def test_load_dialogue_pairs_conversation(tmp_path: Path):
         text_field="form",
         shuffle=False,
     )
-    pairs = load_dialogue_pairs(cfg)
+    pairs, mono_docs = unpack_pairs(load_dialogue_pairs(cfg))
     assert pairs == [
         ("안녕하세요", "반가워요"),
         ("반가워요", "오늘 기분이 어때요?"),
     ]
+    assert any("안녕하세요" in doc for doc in mono_docs)
 
     cfg_turn = DataConfig(
         zip_path=str(zip_path),
@@ -141,7 +159,7 @@ def test_load_dialogue_pairs_conversation(tmp_path: Path):
         text_field="form",
         shuffle=False,
     )
-    pairs_turn = load_dialogue_pairs(cfg_turn)
+    pairs_turn, _ = unpack_pairs(load_dialogue_pairs(cfg_turn))
     assert pairs_turn == [
         ("안녕하세요", "반가워요"),
         ("반가워요", "오늘 기분이 어때요?"),
@@ -195,7 +213,7 @@ def test_load_dialogue_pairs_merges_consecutive_turns(tmp_path: Path):
         text_field="form",
         shuffle=False,
     )
-    pairs = load_dialogue_pairs(cfg)
+    pairs, _ = unpack_pairs(load_dialogue_pairs(cfg))
     assert pairs == [("안녕 반가워", "잘 지냈어 오늘 뭐해?")]
 
 
@@ -250,6 +268,60 @@ def test_load_dialogue_pairs_skips_missing_speaker(tmp_path: Path, caplog):
         shuffle=False,
     )
 
-    pairs = load_dialogue_pairs(cfg)
+    pairs, _ = unpack_pairs(load_dialogue_pairs(cfg))
     assert pairs == [("안녕", "반가워")]
     assert "missing speaker_id" in caplog.text
+
+
+def test_load_dialogue_pairs_handles_prose_documents(tmp_path: Path):
+    payload = {
+        "id": "news-1",
+        "text": "오늘은 맑은 하늘과 따뜻한 바람이 불어오는 봄날입니다.",
+        "summary": "맑은 봄날 기사",
+    }
+
+    zip_path = make_zip(tmp_path / "news.zip", payload)
+    cfg = DataConfig(
+        zip_path=str(zip_path),
+        text_field="form",
+        shuffle=False,
+    )
+
+    pairs, mono_docs = unpack_pairs(load_dialogue_pairs(cfg))
+    assert isinstance(pairs, list)
+    assert pairs == []
+    assert mono_docs, "Expected prose documents to populate mono_docs"
+    assert any("맑은 하늘" in doc for doc in mono_docs)
+
+
+def test_load_dialogue_pairs_handles_nested_prose_documents(tmp_path: Path):
+    payload = {
+        "id": "news-2",
+        "document": [
+            {
+                "id": "article-1",
+                "paragraphs": [
+                    {"text": "봄비가 촉촉하게 내려 도심 가로수가 더욱 푸르게 물들었습니다."},
+                    {
+                        "text": [
+                            "주말 사이 시민들은 공원을 찾아 산책을 즐겼고",
+                            "도서관과 미술관 같은 실내 시설도 붐볐습니다.",
+                        ]
+                    },
+                ],
+                "metadata": {"category": "society"},
+            }
+        ],
+    }
+
+    zip_path = make_zip(tmp_path / "nested_news.zip", payload)
+    cfg = DataConfig(
+        zip_path=str(zip_path),
+        text_field="form",
+        shuffle=False,
+    )
+
+    pairs, mono_docs = unpack_pairs(load_dialogue_pairs(cfg))
+    assert pairs == []
+    assert mono_docs, "Nested prose structures should populate mono_docs"
+    assert any("봄비가 촉촉" in doc for doc in mono_docs)

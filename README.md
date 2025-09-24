@@ -5,7 +5,9 @@ Korean Molu Chatbot
 This repository now contains a configurable training pipeline that can be executed
 directly from Google Colab. The `molu_chatbot.py` script handles dataset
 preparation, SentencePiece tokenisation, model training, checkpoint saving and
-inference utilities.
+inference utilities. Dialogue corpora remain first-class citizens, but the data
+loader now also understands prose-style JSON exports such as news articles with
+top-level `text` or `content` fields.
 
 ## Quick start on Google Colab
 
