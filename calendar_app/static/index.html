@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>플릿 일정 관리</title>
+    <link href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.10/index.global.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1.5.10/css/pico.min.css">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <main class="container">
+        <header>
+            <h1>플릿 일정 캘린더</h1>
+            <p class="subtitle">날짜와 시간을 드래그하여 선택한 뒤, 세부 정보를 입력해 일정을 기록하세요.</p>
+        </header>
+
+        <section class="grid">
+            <article>
+                <div id="calendar"></div>
+            </article>
+            <article>
+                <form id="event-form">
+                    <fieldset>
+                        <legend>선택한 시간</legend>
+                        <label>
+                            시작
+                            <input type="text" id="start" name="start" readonly required>
+                        </label>
+                        <label>
+                            종료
+                            <input type="text" id="end" name="end" readonly required>
+                        </label>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>세부 정보</legend>
+                        <label>
+                            플릿 컴포
+                            <input type="text" id="fleet" name="fleet" placeholder="플릿 컴포를 입력하세요" required>
+                        </label>
+                        <label>
+                            독트린
+                            <input type="text" id="doctrine" name="doctrine" placeholder="독트린을 입력하세요" required>
+                        </label>
+                        <label>
+                            핸드아웃 여부
+                            <select id="handout" name="handout" required>
+                                <option value="">선택하세요</option>
+                                <option value="배포">배포</option>
+                                <option value="미배포">미배포</option>
+                            </select>
+                        </label>
+                    </fieldset>
+
+                    <div class="button-group">
+                        <button type="submit" id="add-event" disabled>일정 추가</button>
+                    </div>
+                    <p id="status" role="status"></p>
+                </form>
+                <section id="summary-card" aria-live="polite">
+                    <h2>최근 일정 요약</h2>
+                    <div class="summary-body">
+                        <p>날짜/시간을 선택한 후 일정을 추가하면 요약이 표시됩니다.</p>
+                    </div>
+                </section>
+            </article>
+        </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.10/index.global.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

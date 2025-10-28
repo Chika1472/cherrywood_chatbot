@@ -1,0 +1,70 @@
+body {
+    background: var(--pico-background-color);
+    color: var(--pico-color);
+}
+
+main.container {
+    margin-top: 2rem;
+    margin-bottom: 2rem;
+}
+
+header {
+    margin-bottom: 1.5rem;
+}
+
+.subtitle {
+    color: var(--pico-muted-color);
+}
+
+#calendar {
+    background: var(--pico-card-background-color);
+    border-radius: 0.75rem;
+    padding: 1rem;
+    box-shadow: 0 20px 25px -15px rgba(10, 14, 29, 0.3);
+}
+
+#event-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+#event-form fieldset {
+    border-radius: 0.75rem;
+}
+
+.button-group {
+    display: flex;
+    gap: 0.5rem;
+}
+
+#summary-card {
+    margin-top: 2rem;
+    background: var(--pico-card-background-color);
+    border-radius: 0.75rem;
+    padding: 1.5rem;
+    box-shadow: 0 20px 25px -15px rgba(10, 14, 29, 0.3);
+}
+
+.summary-body {
+    display: grid;
+    gap: 0.5rem;
+    font-size: 1rem;
+}
+
+.summary-body dt {
+    font-weight: 600;
+}
+
+.summary-body dd {
+    margin-left: 0;
+    color: var(--pico-muted-color);
+}
+
+@media (max-width: 992px) {
+    .grid {
+        display: flex;
+        flex-direction: column;
+        gap: 2rem;
+    }
+}

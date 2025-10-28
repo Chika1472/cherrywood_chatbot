@@ -79,3 +79,11 @@ performs top-p sampling and prints the chatbot's response.
   and gradient clipping.
 - Cosine learning rate schedule with configurable warm-up.
 - Automatic validation, checkpointing and logging of metrics per epoch.
+
+## 플릿 일정 웹 캘린더
+
+`calendar_app/` 디렉터리에는 FullCalendar 기반의 정적 웹 페이지가 포함되어 있어
+날짜와 시간을 드래그해 선택하고 "플릿 컴포", "독트린", "핸드아웃 여부" 정보를
+입력해 일정을 기록할 수 있습니다. 정적 파일(`calendar_app/static/`)을 임의의 웹
+서버 또는 호스팅 서비스에 올려 간단히 사용할 수 있으며, 자세한 내용은
+`calendar_app/README.md`에서 확인하세요.
